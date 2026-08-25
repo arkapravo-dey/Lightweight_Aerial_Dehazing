@@ -141,56 +141,103 @@ class MSPA(nn.Module):
 
 # ============================================================
 # Haar DWT / IWT
+#
+# Optimized: implemented as a single grouped (depthwise) strided
+# conv2d / conv_transpose2d instead of four strided-slice reads (or
+# scatter-writes) plus separate elementwise adds. This maps onto one
+# fused cuDNN kernel with coalesced memory access instead of several
+# small, non-coalesced kernel launches, which matters here because
+# FBR (and therefore HaarDWT/HaarIWT) runs inside every block, on
+# every forward and backward pass.
+#
+# The 2x2 stride-2 Haar filters below are mathematically identical to
+# the original slicing formulas (verified numerically to float64
+# machine precision):
+#   LL = [[ 0.5,  0.5], [ 0.5,  0.5]]
+#   LH = [[-0.5,  0.5], [-0.5,  0.5]]
+#   HL = [[-0.5, -0.5], [ 0.5,  0.5]]
+#   HH = [[ 0.5, -0.5], [-0.5,  0.5]]
+# Because the (scaled) Haar transform is orthogonal, the exact same
+# filter bank is reused, unchanged, as the conv_transpose2d weight for
+# the inverse transform.
 # ============================================================
+
+_HAAR_BASE_KERNELS = torch.tensor([
+    [[0.5, 0.5], [0.5, 0.5]],     # LL
+    [[-0.5, 0.5], [-0.5, 0.5]],   # LH
+    [[-0.5, -0.5], [0.5, 0.5]],   # HL
+    [[0.5, -0.5], [-0.5, 0.5]],   # HH
+])  # (4, 2, 2)
+
 
 class HaarDWT(nn.Module):
 
+    def __init__(self, channels):
+        super().__init__()
+
+        self.channels = channels
+
+        # weight shape (4*C, 1, 2, 2): grouped conv with groups=C, so
+        # group g (= input channel g) produces 4 consecutive output
+        # channels [LL_g, LH_g, HL_g, HH_g].
+        weight = _HAAR_BASE_KERNELS.unsqueeze(1).repeat(channels, 1, 1, 1)
+        self.register_buffer('weight', weight, persistent=False)
+
     def forward(self, x):
 
-        H, W = x.shape[-2:]
+        B, C, H, W = x.shape
 
         if H % 2 != 0 or W % 2 != 0:
             raise ValueError(
                 "HaarDWT requires even spatial dimensions."
             )
 
-        x00 = x[:, :, 0::2, 0::2]
-        x01 = x[:, :, 0::2, 1::2]
-        x10 = x[:, :, 1::2, 0::2]
-        x11 = x[:, :, 1::2, 1::2]
+        out = F.conv2d(
+            x,
+            self.weight.to(dtype=x.dtype),
+            bias=None,
+            stride=2,
+            groups=C
+        )  # (B, 4C, H/2, W/2)
 
-        LL = (x00 + x01 + x10 + x11) / 2.0
-        LH = (-x00 + x01 - x10 + x11) / 2.0
-        HL = (-x00 - x01 + x10 + x11) / 2.0
-        HH = (x00 - x01 - x10 + x11) / 2.0
+        out = out.view(B, C, 4, H // 2, W // 2)
+
+        LL = out[:, :, 0]
+        LH = out[:, :, 1]
+        HL = out[:, :, 2]
+        HH = out[:, :, 3]
 
         return LL, LH, HL, HH
 
 
 class HaarIWT(nn.Module):
 
-    def forward(self, LL, LH, HL, HH):
+    def __init__(self, channels):
+        super().__init__()
 
-        x00 = (LL - LH - HL + HH) / 2.0
-        x01 = (LL + LH - HL - HH) / 2.0
-        x10 = (LL - LH + HL - HH) / 2.0
-        x11 = (LL + LH + HL + HH) / 2.0
+        self.channels = channels
+
+        # ConvTranspose2d weight shape: (in_channels, out_channels/groups, kH, kW)
+        # in_channels = 4C, groups = C, out_channels/groups = 1.
+        weight = _HAAR_BASE_KERNELS.unsqueeze(1).repeat(channels, 1, 1, 1)
+        self.register_buffer('weight', weight, persistent=False)
+
+    def forward(self, LL, LH, HL, HH):
 
         B, C, H, W = LL.shape
 
-        out = torch.zeros(
-            B,
-            C,
-            H * 2,
-            W * 2,
-            device=LL.device,
-            dtype=LL.dtype
-        )
+        # Interleave per-channel as [LL_c, LH_c, HL_c, HH_c, ...] to
+        # match the grouped weight layout from HaarDWT.
+        x = torch.stack([LL, LH, HL, HH], dim=2)  # (B, C, 4, H, W)
+        x = x.reshape(B, 4 * C, H, W)
 
-        out[:, :, 0::2, 0::2] = x00
-        out[:, :, 0::2, 1::2] = x01
-        out[:, :, 1::2, 0::2] = x10
-        out[:, :, 1::2, 1::2] = x11
+        out = F.conv_transpose2d(
+            x,
+            self.weight.to(dtype=LL.dtype),
+            bias=None,
+            stride=2,
+            groups=C
+        )
 
         return out
 
@@ -278,8 +325,8 @@ class FBR(nn.Module):
             bias=True
         )
 
-        self.dwt = HaarDWT()
-        self.iwt = HaarIWT()
+        self.dwt = HaarDWT(channels)
+        self.iwt = HaarIWT(channels)
 
     def forward(self, x):
 
@@ -666,5 +713,3 @@ class UNet(nn.Module):
         x = self.patch_unembed(x)
 
         return x
-
-
