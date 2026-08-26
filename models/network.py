@@ -220,9 +220,49 @@ class FBR(nn.Module):
         self.dwt = HaarDWT(channels)
         self.iwt = HaarIWT()
 
-        self.freq_attn = nn.Conv2d(
+        self.ll_dw = nn.Conv2d(
             channels,
             channels,
+            3,
+            padding=1,
+            groups=channels,
+            bias=False
+        )
+
+        self.ll_pw = nn.Conv2d(
+            channels,
+            channels,
+            1,
+            bias=False
+        )
+
+        self.ll_gate = nn.Conv2d(
+            channels,
+            1,
+            1,
+            bias=True
+        )
+
+        self.high_dw = nn.Conv2d(
+            channels,
+            channels,
+            3,
+            padding=2,
+            dilation=2,
+            groups=channels,
+            bias=False
+        )
+
+        self.high_pw = nn.Conv2d(
+            channels,
+            channels,
+            1,
+            bias=False
+        )
+
+        self.high_gate = nn.Conv2d(
+            channels,
+            1,
             1,
             bias=True
         )
@@ -231,25 +271,58 @@ class FBR(nn.Module):
 
         LL, LH, HL, HH = self.dwt(x)
 
-        freq = LL + LH + HL + HH
+        ll_feat = self.ll_dw(LL)
+        ll_feat = self.ll_pw(ll_feat)
 
-        A = torch.sigmoid(
-            self.freq_attn(freq)
+        ll_attn = torch.sigmoid(
+            self.ll_gate(ll_feat)
         )
 
-        LL = LL * (1.0 + A)
-        LH = LH * (1.0 + A)
-        HL = HL * (1.0 + A)
-        HH = HH * (1.0 + A)
+        LL = LL * (1.0 + ll_attn)
 
-        out = self.iwt(
+        high = torch.stack(
+            [LH, HL, HH],
+            dim=1
+        )
+
+        B, N, C, H, W = high.shape
+
+        high = high.reshape(
+            B * N,
+            C,
+            H,
+            W
+        )
+
+        high_ref = self.high_dw(high)
+        high_ref = self.high_pw(high_ref)
+
+        high = high + high_ref
+
+        high_attn = torch.sigmoid(
+            self.high_gate(high)
+        )
+
+        high = high * (1.0 + high_attn)
+
+        high = high.reshape(
+            B,
+            N,
+            C,
+            H,
+            W
+        )
+
+        LH = high[:, 0]
+        HL = high[:, 1]
+        HH = high[:, 2]
+
+        return self.iwt(
             LL,
             LH,
             HL,
             HH
         )
-
-        return out
 
 
 class CGB(nn.Module):
