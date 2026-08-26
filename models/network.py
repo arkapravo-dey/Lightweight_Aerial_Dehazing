@@ -86,13 +86,6 @@ class MSPA(nn.Module):
             bias=False
         )
 
-        self.fuse = nn.Conv2d(
-            channels * 3,
-            channels,
-            1,
-            bias=True
-        )
-
         self.pixel_gate = nn.Conv2d(
             channels,
             1,
@@ -103,22 +96,17 @@ class MSPA(nn.Module):
     def forward(self, x):
 
         x_abs = torch.abs(x)
+
         x3 = self.conv3(x)
         x5 = self.conv5(x)
 
-        feat = torch.cat(
-            [x_abs, x3, x5],
-            dim=1
-        )
-
-        feat = self.fuse(feat)
+        feat = x_abs + x3 + x5
 
         attn = torch.sigmoid(
             self.pixel_gate(feat)
         )
 
-        return x * attn
-
+        return x * (1.0 + attn)
 
 _HAAR_BASE_KERNELS = torch.tensor([
     [[0.5, 0.5], [0.5, 0.5]],
