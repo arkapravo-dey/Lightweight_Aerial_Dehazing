@@ -257,20 +257,11 @@ class CGB(nn.Module):
     def __init__(self, channels):
         super().__init__()
 
-        self.preserve = nn.Sequential(
-            nn.Conv2d(
-                channels,
-                channels,
-                1,
-                bias=False
-            ),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                channels,
-                channels,
-                1,
-                bias=False
-            )
+        self.preserve = nn.Conv2d(
+            channels,
+            channels,
+            1,
+            bias=False
         )
 
         self.suppress = nn.Sequential(
@@ -282,49 +273,32 @@ class CGB(nn.Module):
                 groups=channels,
                 bias=False
             ),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                channels,
-                channels,
-                1,
-                bias=False
-            )
+            nn.ReLU(inplace=True)
         )
 
-        self.gate_p = nn.Conv2d(
+        self.gate = nn.Conv2d(
             channels,
-            channels,
-            1
-        )
-
-        self.gate_s = nn.Conv2d(
-            channels,
-            channels,
-            1
+            1,
+            1,
+            bias=True
         )
 
     def forward(self, x):
 
         Xp = self.preserve(x)
+
         Xs = self.suppress(x)
 
-        Ap = self.gate_p(x)
-        As = self.gate_s(x)
-
-        gates = torch.stack(
-            [Ap, As],
-            dim=1
+        Gp = torch.sigmoid(
+            self.gate(x)
         )
 
-        gates = F.softmax(
-            gates,
-            dim=1
+        Gs = 1.0 - Gp
+
+        return (
+            Gp * Xp +
+            Gs * Xs
         )
-
-        Gp = gates[:, 0]
-        Gs = gates[:, 1]
-
-        return Gp * Xp + Gs * Xs
 
 
 class ProposedBlock(nn.Module):
