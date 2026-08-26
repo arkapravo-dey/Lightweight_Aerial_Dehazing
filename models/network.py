@@ -380,24 +380,31 @@ class ProposedBlock(nn.Module):
         self,
         c,
         drop_path=0.,
-        FFN_Expand=2
+        FFN_Expand=2,
+        use_fbr=False
     ):
         super().__init__()
 
         self.norm1 = LayerNorm2d(c)
 
         self.mspa = MSPA(c)
-        self.fbr = FBR(c)
-        self.cgb = CGB(c)
 
-        self.beta = nn.Parameter(
-            torch.zeros(1, c, 1, 1)
-        )
+        self.fbr = FBR(c) if use_fbr else nn.Identity()
+
+        self.cgb = CGB(c)
 
         self.drop_path = (
             DropPath(drop_path)
             if drop_path > 0.
             else nn.Identity()
+        )
+
+        self.beta = nn.Parameter(
+            torch.zeros((1, c, 1, 1))
+        )
+
+        self.gamma = nn.Parameter(
+            torch.zeros((1, c, 1, 1))
         )
 
         self.norm2 = LayerNorm2d(c)
@@ -416,33 +423,31 @@ class ProposedBlock(nn.Module):
             1
         )
 
-        self.gamma = nn.Parameter(
-            torch.zeros(1, c, 1, 1)
-        )
-
     def forward(self, x):
 
-        out = self.norm1(x)
+        x_norm = self.norm1(x)
 
-        out = self.mspa(out)
+        out = self.mspa(x_norm)
+
         out = self.fbr(out)
+
         out = self.cgb(out)
 
-        x = x + self.drop_path(
+        out = x + self.drop_path(
             self.beta * out
         )
 
-        ffn = self.norm2(x)
+        ffn = self.norm2(out)
 
         ffn = self.pwconv1(ffn)
+
         ffn = self.act(ffn)
+
         ffn = self.pwconv2(ffn)
 
-        x = x + self.drop_path(
+        return out + self.drop_path(
             self.gamma * ffn
         )
-
-        return x
 
 
 class PatchEmbed(nn.Module):
@@ -492,13 +497,19 @@ class UNet(nn.Module):
     def __init__(
         self,
         img_channel=3,
-        width=64,
+        width=48,
         middle_blk_num=1,
-        enc_blk_nums=[4, 3],
+        enc_blk_nums=[3, 2],
         dec_blk_nums=[1, 1],
         patch_size=8
     ):
         super().__init__()
+
+        self.patch_embed = PatchEmbed(
+            img_channel,
+            width,
+            patch_size
+        )
 
         self.intro = nn.Sequential(
             nn.Conv2d(
@@ -510,12 +521,6 @@ class UNet(nn.Module):
             nn.ReLU()
         )
 
-        self.patch_embed = PatchEmbed(
-            img_channel,
-            width,
-            patch_size
-        )
-
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()
         self.ups = nn.ModuleList()
@@ -523,15 +528,25 @@ class UNet(nn.Module):
 
         chan = width
 
-        for num in enc_blk_nums:
+        for stage_idx, num in enumerate(enc_blk_nums):
+
+            blocks = []
+
+            use_fbr = (
+                stage_idx == 1
+            )
+
+            for _ in range(num):
+
+                blocks.append(
+                    ProposedBlock(
+                        chan,
+                        use_fbr=use_fbr
+                    )
+                )
 
             self.encoders.append(
-                nn.Sequential(
-                    *[
-                        ProposedBlock(chan)
-                        for _ in range(num)
-                    ]
-                )
+                nn.Sequential(*blocks)
             )
 
             self.downs.append(
@@ -545,12 +560,15 @@ class UNet(nn.Module):
 
         self.middle_blks = nn.Sequential(
             *[
-                ProposedBlock(chan)
+                ProposedBlock(
+                    chan,
+                    use_fbr=True
+                )
                 for _ in range(middle_blk_num)
             ]
         )
 
-        for num in dec_blk_nums:
+        for stage_idx, num in enumerate(dec_blk_nums):
 
             self.ups.append(
                 nn.ConvTranspose2d(
@@ -561,13 +579,23 @@ class UNet(nn.Module):
                 )
             )
 
-            self.decoders.append(
-                nn.Sequential(
-                    *[
-                        ProposedBlock(chan)
-                        for _ in range(num)
-                    ]
+            blocks = []
+
+            use_fbr = (
+                stage_idx == 0
+            )
+
+            for _ in range(num):
+
+                blocks.append(
+                    ProposedBlock(
+                        chan,
+                        use_fbr=use_fbr
+                    )
                 )
+
+            self.decoders.append(
+                nn.Sequential(*blocks)
             )
 
         self.patch_unembed = PatchUnEmbed(
@@ -578,11 +606,9 @@ class UNet(nn.Module):
 
     def forward(self, inp):
 
-        x = self.intro(inp)
+        x = x_skip = self.intro(inp)
 
         x = self.patch_embed(x)
-
-        x_skip = x
 
         encs = []
 
@@ -611,8 +637,6 @@ class UNet(nn.Module):
 
             x = decoder(x)
 
-        x = x + x_skip
-
         x = self.patch_unembed(x)
 
-        return x
+        return x + x_skip
