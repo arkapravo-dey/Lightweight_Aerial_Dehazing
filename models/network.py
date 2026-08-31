@@ -64,49 +64,73 @@ class SimpleGate(nn.Module):
 
 
 class MSPA(nn.Module):
-
-    def __init__(self, channels):
+    def __init__(self, channels, N=3):
         super().__init__()
 
-        self.conv3 = nn.Conv2d(
+        self.N = N
+
+        self.conv_1xN = nn.Conv2d(
             channels,
             channels,
-            3,
+            kernel_size=(1, N),
+            padding=(0, N // 2),
+            bias=False
+        )
+
+        self.conv_Nx1 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(N, 1),
+            padding=(N // 2, 0),
+            bias=False
+        )
+
+        self.conv_d1 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
             padding=1,
-            groups=channels,
+            dilation=1,
             bias=False
         )
 
-        self.conv5 = nn.Conv2d(
+        self.conv_d2 = nn.Conv2d(
             channels,
             channels,
-            5,
+            kernel_size=3,
             padding=2,
-            groups=channels,
+            dilation=2,
             bias=False
         )
 
-        self.pixel_gate = nn.Conv2d(
+        self.conv_d3 = nn.Conv2d(
             channels,
-            1,
-            1,
+            channels,
+            kernel_size=3,
+            padding=3,
+            dilation=3,
+            bias=False
+        )
+        self.fusion = nn.Conv2d(
+            channels * 3,
+            channels,
+            kernel_size=1,
             bias=True
         )
 
     def forward(self, x):
-
-        x_abs = torch.abs(x)
-
-        x3 = self.conv3(x)
-        x5 = self.conv5(x)
-
-        feat = x_abs + x3 + x5
-
-        attn = torch.sigmoid(
-            self.pixel_gate(feat)
+        x = self.conv_1xN(x)
+        x = self.conv_Nx1(x)
+        x_d1 = self.conv_d1(x)
+        x_d2 = self.conv_d2(x)
+        x_d3 = self.conv_d3(x)
+        x_cat = torch.cat(
+            [x_d1, x_d2, x_d3],
+            dim=1
         )
-
-        return x * (1.0 + attn)
+        attn = self.fusion(x_cat)
+        attn = torch.sigmoid(attn)
+        return attn
 
 _HAAR_BASE_KERNELS = torch.tensor([
     [[0.5, 0.5], [0.5, 0.5]],
@@ -359,7 +383,6 @@ class CGB(nn.Module):
     def forward(self, x):
 
         Xp = self.preserve(x)
-
         Xs = self.suppress(x)
 
         Gp = torch.sigmoid(
@@ -381,16 +404,12 @@ class ProposedBlock(nn.Module):
         c,
         drop_path=0.,
         FFN_Expand=2,
-        use_fbr=False
     ):
         super().__init__()
 
         self.norm1 = LayerNorm2d(c)
-
         self.mspa = MSPA(c)
-
-        self.fbr = FBR(c) if use_fbr else nn.Identity()
-
+        self.fbr = FBR(c)
         self.cgb = CGB(c)
 
         self.drop_path = (
@@ -426,11 +445,9 @@ class ProposedBlock(nn.Module):
     def forward(self, x):
 
         x_norm = self.norm1(x)
-
-        out = self.mspa(x_norm)
-
+        attn = self.mspa(x_norm)
+        out = x_norm * attn
         out = self.fbr(out)
-
         out = self.cgb(out)
 
         out = x + self.drop_path(
@@ -438,11 +455,8 @@ class ProposedBlock(nn.Module):
         )
 
         ffn = self.norm2(out)
-
         ffn = self.pwconv1(ffn)
-
         ffn = self.act(ffn)
-
         ffn = self.pwconv2(ffn)
 
         return out + self.drop_path(
@@ -532,17 +546,10 @@ class UNet(nn.Module):
 
             blocks = []
 
-            use_fbr = (
-                stage_idx == 1
-            )
-
             for _ in range(num):
 
                 blocks.append(
-                    ProposedBlock(
-                        chan,
-                        use_fbr=use_fbr
-                    )
+                    ProposedBlock(chan)
                 )
 
             self.encoders.append(
@@ -560,10 +567,7 @@ class UNet(nn.Module):
 
         self.middle_blks = nn.Sequential(
             *[
-                ProposedBlock(
-                    chan,
-                    use_fbr=True
-                )
+                ProposedBlock(chan)
                 for _ in range(middle_blk_num)
             ]
         )
@@ -581,17 +585,10 @@ class UNet(nn.Module):
 
             blocks = []
 
-            use_fbr = (
-                stage_idx == 0
-            )
-
             for _ in range(num):
 
                 blocks.append(
-                    ProposedBlock(
-                        chan,
-                        use_fbr=use_fbr
-                    )
+                    ProposedBlock(chan)
                 )
 
             self.decoders.append(
@@ -607,9 +604,7 @@ class UNet(nn.Module):
     def forward(self, inp):
 
         x = x_skip = self.intro(inp)
-
         x = self.patch_embed(x)
-
         encs = []
 
         for encoder, down in zip(
@@ -618,9 +613,7 @@ class UNet(nn.Module):
         ):
 
             x = encoder(x)
-
             encs.append(x)
-
             x = down(x)
 
         x = self.middle_blks(x)
@@ -632,9 +625,7 @@ class UNet(nn.Module):
         ):
 
             x = up(x)
-
             x = x + enc_skip
-
             x = decoder(x)
 
         x = self.patch_unembed(x)
