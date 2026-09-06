@@ -226,7 +226,7 @@ if __name__ == '__main__':
     best_ssim = 0
 
     for epoch in tqdm(
-        range(args.epochs + 1),
+        range(1, args.epochs + 1),
         desc='Training Progress',
         leave=True
     ):
