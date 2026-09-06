@@ -10,7 +10,7 @@ from configs.config import get_args
 if __name__ == '__main__':
     args = get_args()
 
-    network = UNet(width=64, enc_blk_nums=[4,3], dec_blk_nums=[2, 2], middle_blk_num=1).cuda()
+    network = UNet(width=48, enc_blk_nums=[3,2], dec_blk_nums=[1, 1], middle_blk_num=1).cuda()
     network = nn.DataParallel(network).cuda()
 
     test_thick_dataset = SateHaze1KDataset(root_dir=args.test_thick_dir, transform=transform)
