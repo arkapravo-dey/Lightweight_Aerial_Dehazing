@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from timm.models.layers import DropPath
 
 
@@ -132,221 +131,187 @@ class MSPA(nn.Module):
         attn = torch.sigmoid(attn)
         return attn
 
-_HAAR_BASE_KERNELS = torch.tensor([
-    [[0.5, 0.5], [0.5, 0.5]],
-    [[-0.5, 0.5], [-0.5, 0.5]],
-    [[-0.5, -0.5], [0.5, 0.5]],
-    [[0.5, -0.5], [-0.5, 0.5]]
-])
-
-
-class HaarDWT(nn.Module):
-
-    def __init__(self, channels):
+class FBR(nn.Module):
+    def __init__(
+        self,
+        channels,
+        low_ratio=0.25,
+        high_ratio=0.60
+    ):
         super().__init__()
 
-        weight = _HAAR_BASE_KERNELS.unsqueeze(1).repeat(
-            channels,
-            1,
-            1,
-            1
+        if not (0.0 < low_ratio < high_ratio < 1.0):
+            raise ValueError(
+                "Require 0 < low_ratio < high_ratio < 1."
+            )
+
+        self.channels = channels
+        self.low_ratio = low_ratio
+        self.high_ratio = high_ratio
+
+        self.low_gate = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=1,
+                bias=True
+            ),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=1,
+                bias=True
+            ),
+            nn.Sigmoid()
         )
 
-        self.register_buffer(
-            "weight",
-            weight,
-            persistent=False
+        self.mid_gate = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=1,
+                bias=True
+            ),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=1,
+                bias=True
+            ),
+            nn.Sigmoid()
+        )
+
+        self.high_gate = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=1,
+                bias=True
+            ),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=1,
+                bias=True
+            ),
+            nn.Sigmoid()
+        )
+
+    def _get_radial_masks(self, H, W, device, dtype):
+
+        y = torch.arange(
+            H,
+            device=device,
+            dtype=dtype
+        ) - (H // 2)
+
+        x = torch.arange(
+            W,
+            device=device,
+            dtype=dtype
+        ) - (W // 2)
+
+        yy, xx = torch.meshgrid(
+            y,
+            x,
+            indexing="ij"
+        )
+
+        radius = torch.sqrt(
+            xx.pow(2) + yy.pow(2)
+        )
+
+        max_radius = radius.max().clamp_min(1.0)
+
+        normalized_radius = radius / max_radius
+
+        low_mask = (
+            normalized_radius <= self.low_ratio
+        )
+
+        mid_mask = (
+            (normalized_radius > self.low_ratio)
+            & (normalized_radius <= self.high_ratio)
+        )
+
+        high_mask = (
+            normalized_radius > self.high_ratio
+        )
+
+        return (
+            low_mask.to(dtype=dtype),
+            mid_mask.to(dtype=dtype),
+            high_mask.to(dtype=dtype)
         )
 
     def forward(self, x):
 
         B, C, H, W = x.shape
 
-        if H % 2 != 0 or W % 2 != 0:
-            raise ValueError(
-                "HaarDWT requires even spatial dimensions."
-            )
-
-        out = F.conv2d(
+        X = torch.fft.fft2(
             x,
-            self.weight.to(dtype=x.dtype),
-            stride=2,
-            groups=C
+            dim=(-2, -1),
+            norm="ortho"
         )
 
-        out = out.view(
-            B,
-            C,
-            4,
-            H // 2,
-            W // 2
+        X_shifted = torch.fft.fftshift(
+            X,
+            dim=(-2, -1)
         )
 
-        LL = out[:, :, 0]
-        LH = out[:, :, 1]
-        HL = out[:, :, 2]
-        HH = out[:, :, 3]
+        magnitude = torch.abs(X_shifted)
+        phase = torch.angle(X_shifted)
 
-        return LL, LH, HL, HH
-
-
-class HaarIWT(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, LL, LH, HL, HH):
-
-        x00 = (LL - LH - HL + HH) / 2.0
-        x01 = (LL + LH - HL - HH) / 2.0
-        x10 = (LL - LH + HL - HH) / 2.0
-        x11 = (LL + LH + HL + HH) / 2.0
-
-        B, C, H, W = LL.shape
-
-        x = torch.stack(
-            [x00, x01, x10, x11],
-            dim=-1
-        )
-
-        x = x.view(
-            B,
-            C,
+        low_mask, mid_mask, high_mask = self._get_radial_masks(
             H,
             W,
-            2,
-            2
+            x.device,
+            magnitude.dtype
         )
 
-        x = x.permute(
-            0,
-            1,
-            2,
-            4,
-            3,
-            5
+        low_mask = low_mask.view(1, 1, H, W)
+        mid_mask = mid_mask.view(1, 1, H, W)
+        high_mask = high_mask.view(1, 1, H, W)
+
+        M_low = magnitude * low_mask
+        M_mid = magnitude * mid_mask
+        M_high = magnitude * high_mask
+
+        G_low = self.low_gate(M_low)
+        G_mid = self.mid_gate(M_mid)
+        G_high = self.high_gate(M_high)
+
+        M_low_ref = M_low * G_low
+        M_mid_ref = M_mid * G_mid
+        M_high_ref = M_high * G_high
+
+        magnitude_refined = (
+            M_low_ref
+            + M_mid_ref
+            + M_high_ref
         )
 
-        x = x.reshape(
-            B,
-            C,
-            H * 2,
-            W * 2
+        X_refined_shifted = torch.polar(
+            magnitude_refined,
+            phase
         )
 
-        return x
-
-class FBR(nn.Module):
-
-    def __init__(self, channels):
-        super().__init__()
-
-        self.dwt = HaarDWT(channels)
-        self.iwt = HaarIWT()
-
-        self.ll_dw = nn.Conv2d(
-            channels,
-            channels,
-            3,
-            padding=1,
-            groups=channels,
-            bias=False
+        X_refined = torch.fft.ifftshift(
+            X_refined_shifted,
+            dim=(-2, -1)
         )
 
-        self.ll_pw = nn.Conv2d(
-            channels,
-            channels,
-            1,
-            bias=False
+        out = torch.fft.ifft2(
+            X_refined,
+            dim=(-2, -1),
+            norm="ortho"
         )
 
-        self.ll_gate = nn.Conv2d(
-            channels,
-            1,
-            1,
-            bias=True
-        )
+        return out.real
 
-        self.high_dw = nn.Conv2d(
-            channels,
-            channels,
-            3,
-            padding=2,
-            dilation=2,
-            groups=channels,
-            bias=False
-        )
-
-        self.high_pw = nn.Conv2d(
-            channels,
-            channels,
-            1,
-            bias=False
-        )
-
-        self.high_gate = nn.Conv2d(
-            channels,
-            1,
-            1,
-            bias=True
-        )
-
-    def forward(self, x):
-
-        LL, LH, HL, HH = self.dwt(x)
-
-        ll_feat = self.ll_dw(LL)
-        ll_feat = self.ll_pw(ll_feat)
-
-        ll_attn = torch.sigmoid(
-            self.ll_gate(ll_feat)
-        )
-
-        LL = LL * (1.0 + ll_attn)
-
-        high = torch.stack(
-            [LH, HL, HH],
-            dim=1
-        )
-
-        B, N, C, H, W = high.shape
-
-        high = high.reshape(
-            B * N,
-            C,
-            H,
-            W
-        )
-
-        high_ref = self.high_dw(high)
-        high_ref = self.high_pw(high_ref)
-
-        high = high + high_ref
-
-        high_attn = torch.sigmoid(
-            self.high_gate(high)
-        )
-
-        high = high * (1.0 + high_attn)
-
-        high = high.reshape(
-            B,
-            N,
-            C,
-            H,
-            W
-        )
-
-        LH = high[:, 0]
-        HL = high[:, 1]
-        HH = high[:, 2]
-
-        return self.iwt(
-            LL,
-            LH,
-            HL,
-            HH
-        )
 
 
 class CGB(nn.Module):
