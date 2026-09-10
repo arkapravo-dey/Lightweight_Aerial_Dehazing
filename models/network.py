@@ -68,21 +68,21 @@ class MSPA(nn.Module):
 
         self.N = N
 
-        # self.conv_1xN = nn.Conv2d(
-        #     channels,
-        #     channels,
-        #     kernel_size=(1, N),
-        #     padding=(0, N // 2),
-        #     bias=False
-        # )
+        self.conv_1xN = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(1, N),
+            padding=(0, N // 2),
+            bias=False
+        )
 
-        # self.conv_Nx1 = nn.Conv2d(
-        #     channels,
-        #     channels,
-        #     kernel_size=(N, 1),
-        #     padding=(N // 2, 0),
-        #     bias=False
-        # )
+        self.conv_Nx1 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(N, 1),
+            padding=(N // 2, 0),
+            bias=False
+        )
 
         self.conv_d1 = nn.Conv2d(
             channels,
@@ -118,8 +118,8 @@ class MSPA(nn.Module):
         )
 
     def forward(self, x):
-        # x = self.conv_1xN(x)
-        # x = self.conv_Nx1(x)
+        x = self.conv_1xN(x)
+        x = self.conv_Nx1(x)
         x_d1 = self.conv_d1(x)
         x_d2 = self.conv_d2(x)
         x_d3 = self.conv_d3(x)
