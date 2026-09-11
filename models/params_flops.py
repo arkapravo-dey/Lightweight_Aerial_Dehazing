@@ -3,7 +3,7 @@ import torch
 from models.network import UNet
 
 
-net = UNet(width=64, enc_blk_nums=[4, 3], dec_blk_nums=[2, 2], middle_blk_num=1).cuda()
+net = UNet(width=48, enc_blk_nums=[3, 2], dec_blk_nums=[1, 1], middle_blk_num=1).cuda()
 
 torch.cuda.reset_max_memory_allocated()
 x = torch.rand(1, 3, 512, 512).cuda()
