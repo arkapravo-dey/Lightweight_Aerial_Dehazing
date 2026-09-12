@@ -367,12 +367,12 @@ class ProposedBlock(nn.Module):
     def __init__(
         self,
         c,
-        drop_path=0.,
-        FFN_Expand=2,
+        drop_path=0.
     ):
         super().__init__()
 
         self.norm1 = LayerNorm2d(c)
+
         self.mspa = MSPA(c)
         self.fbr = FBR(c)
         self.cgb = CGB(c)
@@ -387,26 +387,6 @@ class ProposedBlock(nn.Module):
             torch.zeros((1, c, 1, 1))
         )
 
-        self.gamma = nn.Parameter(
-            torch.zeros((1, c, 1, 1))
-        )
-
-        self.norm2 = LayerNorm2d(c)
-
-        self.pwconv1 = nn.Conv2d(
-            c,
-            FFN_Expand * c,
-            1
-        )
-
-        self.act = SimpleGate()
-
-        self.pwconv2 = nn.Conv2d(
-            FFN_Expand * c // 2,
-            c,
-            1
-        )
-
     def forward(self, x):
 
         x_norm = self.norm1(x)
@@ -414,20 +394,11 @@ class ProposedBlock(nn.Module):
         out = x_norm * attn
         out = self.fbr(out)
         out = self.cgb(out)
-
         out = x + self.drop_path(
             self.beta * out
         )
 
-        ffn = self.norm2(out)
-        ffn = self.pwconv1(ffn)
-        ffn = self.act(ffn)
-        ffn = self.pwconv2(ffn)
-
-        return out + self.drop_path(
-            self.gamma * ffn
-        )
-
+        return out
 
 class PatchEmbed(nn.Module):
 
